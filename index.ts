@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 
+import 'dotenv/config';
+import winston from 'winston';
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
@@ -223,6 +225,28 @@ const SSE = process.env.SSE === "true";
 const TRANSPORT_MODE = process.env.TRANSPORT_MODE || (SSE ? "sse" : "stdio");
 const SUPPORT_STREAMABLE_HTTP = ["streamable-http", "dual"].includes(TRANSPORT_MODE);
 const SUPPORT_SSE = ["sse", "dual"].includes(TRANSPORT_MODE);
+
+// Configure Winston logger
+const logger = winston.createLogger({
+  level: process.env.LOG_LEVEL || 'info',
+  format: winston.format.combine(
+    winston.format.timestamp(),
+    winston.format.errors({ stack: true }),
+    winston.format.json()
+  ),
+  defaultMeta: { service: 'gitlab-mcp' },
+  transports: [
+    new winston.transports.Console({
+      format: winston.format.combine(
+        winston.format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }),
+        winston.format.colorize(),
+        winston.format.printf(({ timestamp, level, message, ...meta }) => {
+          return `${timestamp} [${level}] ${message} ${Object.keys(meta).length ? JSON.stringify(meta, null, 2) : ''}`;
+        })
+      )
+    })
+  ]
+});
 
 // Add proxy configuration
 const HTTP_PROXY = process.env.HTTP_PROXY;
@@ -4310,58 +4334,137 @@ async function runServer() {
       const app = express();
       app.use(express.json());
       
+      // Add request logging middleware
+      app.use((req, res, next) => {
+        logger.info('Incoming request', {
+          method: req.method,
+          url: req.url,
+          headers: {
+            'content-type': req.get('content-type'),
+            'accept': req.get('accept'),
+            'mcp-session-id': req.get('mcp-session-id'),
+            'user-agent': req.get('user-agent')
+          },
+          ip: req.ip,
+          body: req.body
+        });
+        next();
+      });
+      
       // Session management for SSE transports
       const sseTransports: { [sessionId: string]: SSEServerTransport } = {};
       
       // SSE Transport endpoints (legacy support)
       if (SUPPORT_SSE) {
-        app.get("/sse", async (_: Request, res: Response) => {
+        logger.info('Setting up SSE transport endpoints');
+        
+        app.get("/sse", async (req: Request, res: Response) => {
+          logger.info('SSE connection request', { ip: req.ip, userAgent: req.get('User-Agent') });
           const transport = new SSEServerTransport("/messages", res);
           sseTransports[transport.sessionId] = transport;
+          logger.info('SSE transport created', { sessionId: transport.sessionId });
+          
           res.on("close", () => {
+            logger.info('SSE connection closed', { sessionId: transport.sessionId });
             delete sseTransports[transport.sessionId];
           });
+          
           await server.connect(transport);
         });
 
         app.post("/messages", async (req: Request, res: Response) => {
           const sessionId = req.query.sessionId as string;
+          logger.info('SSE message request', { sessionId, method: req.body?.method, ip: req.ip });
+          
           const transport = sseTransports[sessionId];
           if (transport) {
             await transport.handlePostMessage(req, res);
           } else {
-            res.status(400).send("No transport found for sessionId");
+            logger.warn('SSE transport not found for session', { sessionId, availableSessions: Object.keys(sseTransports) });
+            res.status(400).json({
+              jsonrpc: "2.0",
+              error: {
+                code: -32000,
+                message: "Bad Request: No SSE session found. Use GET /sse to establish SSE connection first."
+              },
+              id: req.body?.id || null
+            });
           }
         });
       }
       
       // Streamable HTTP Transport endpoint
       if (SUPPORT_STREAMABLE_HTTP) {
-        // Create a single StreamableHTTPServerTransport instance
+        logger.info('Setting up Streamable HTTP transport endpoint');
+        
+        // Create a single StreamableHTTPServerTransport instance in stateless mode
         const streamableTransport = new StreamableHTTPServerTransport({
-          sessionIdGenerator: () => generateSessionId(),
+          sessionIdGenerator: undefined, // Stateless mode - no session management
           onsessioninitialized: (sessionId: string) => {
-            console.log(`New streamable HTTP session initialized: ${sessionId}`);
-          }
+            logger.info('New streamable HTTP session initialized', { sessionId });
+          },
+          enableJsonResponse: false // Prefer SSE streams for better client compatibility
         });
+        
+        // Add error handling for the transport
+        streamableTransport.onerror = (error: Error) => {
+          logger.error('StreamableHTTPServerTransport error', { 
+            error: error.message, 
+            stack: error.stack 
+          });
+        };
+        
+        streamableTransport.onclose = () => {
+          logger.info('StreamableHTTPServerTransport closed');
+        };
         
         // Connect to server
         await server.connect(streamableTransport);
+        logger.info('Streamable HTTP transport connected to server');
         
         app.all("/mcp", async (req: Request, res: Response) => {
+          const sessionId = req.headers['mcp-session-id'] as string;
+          const isInitialize = req.body?.method === 'initialize';
+          
+          logger.info('Streamable HTTP request', { 
+            method: req.method, 
+            sessionId, 
+            messageMethod: req.body?.method,
+            messageId: req.body?.id,
+            ip: req.ip,
+            userAgent: req.get('User-Agent'),
+            acceptHeader: req.get('Accept'),
+            isInitialize
+          });
+          
           try {
             // Handle the request using the SDK transport
             await streamableTransport.handleRequest(req, res, req.body);
-          } catch (error) {
-            console.error("Error handling streamable HTTP request:", error);
-            res.status(500).json({
-              jsonrpc: "2.0",
-              id: req.body?.id || null,
-              error: {
-                code: -32603,
-                message: "Internal error"
-              }
+            logger.debug('Streamable HTTP request handled successfully', {
+              method: req.method,
+              messageMethod: req.body?.method,
+              sessionId
             });
+          } catch (error) {
+            logger.error('Error handling streamable HTTP request', { 
+              error: error instanceof Error ? error.message : String(error),
+              stack: error instanceof Error ? error.stack : undefined,
+              method: req.method,
+              messageMethod: req.body?.method,
+              sessionId
+            });
+            
+            // Don't send response if already sent by the transport
+            if (!res.headersSent) {
+              res.status(500).json({
+                jsonrpc: "2.0",
+                id: req.body?.id || null,
+                error: {
+                  code: -32603,
+                  message: "Internal error"
+                }
+              });
+            }
           }
         });
       }
@@ -4380,11 +4483,19 @@ async function runServer() {
 
       const PORT = process.env.PORT || 3002;
       app.listen(PORT, () => {
-        console.log(`Server running on port ${PORT} with transport mode: ${TRANSPORT_MODE}`);
+        logger.info('Server started', { 
+          port: PORT, 
+          transportMode: TRANSPORT_MODE,
+          supportSSE: SUPPORT_SSE,
+          supportStreamableHTTP: SUPPORT_STREAMABLE_HTTP
+        });
       });
     }
   } catch (error) {
-    console.error("Error initializing server:", error);
+    logger.error("Error initializing server", { 
+      error: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : undefined
+    });
     process.exit(1);
   }
 }
@@ -4396,6 +4507,9 @@ function generateSessionId(): string {
 }
 
 runServer().catch(error => {
-  console.error("Fatal error in main():", error);
+  logger.error("Fatal error in main()", { 
+    error: error instanceof Error ? error.message : String(error),
+    stack: error instanceof Error ? error.stack : undefined
+  });
   process.exit(1);
 });

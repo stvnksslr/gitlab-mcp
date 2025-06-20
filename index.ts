@@ -219,6 +219,9 @@ const USE_GITLAB_WIKI = process.env.USE_GITLAB_WIKI === "true";
 const USE_MILESTONE = process.env.USE_MILESTONE === "true";
 const USE_PIPELINE = process.env.USE_PIPELINE === "true";
 const SSE = process.env.SSE === "true";
+const TRANSPORT_MODE = process.env.TRANSPORT_MODE || (SSE ? "sse" : "stdio");
+const SUPPORT_STREAMABLE_HTTP = ["streamable-http", "dual"].includes(TRANSPORT_MODE);
+const SUPPORT_SSE = ["sse", "dual"].includes(TRANSPORT_MODE);
 
 // Add proxy configuration
 const HTTP_PROXY = process.env.HTTP_PROXY;
@@ -4299,51 +4302,135 @@ server.setRequestHandler(CallToolRequestSchema, async request => {
  */
 async function runServer() {
   try {
-    // Server startup banner removed - inappropriate use of console.error for logging
-    // Server version banner removed - inappropriate use of console.error for logging
-    // API URL banner removed - inappropriate use of console.error for logging
-    // Server startup banner removed - inappropriate use of console.error for logging
-    if (!SSE) {
+    if (TRANSPORT_MODE === "stdio") {
       const transport = new StdioServerTransport();
       await server.connect(transport);
-    } else {
+    } else if (SUPPORT_SSE || SUPPORT_STREAMABLE_HTTP) {
       const app = express();
-      const transports: { [sessionId: string]: SSEServerTransport } = {};
-      app.get("/sse", async (_: Request, res: Response) => {
-        const transport = new SSEServerTransport("/messages", res);
-        transports[transport.sessionId] = transport;
-        res.on("close", () => {
-          delete transports[transport.sessionId];
+      app.use(express.json());
+      
+      // Session management for both transports
+      const sseTransports: { [sessionId: string]: SSEServerTransport } = {};
+      const streamableSessions: { [sessionId: string]: any } = {};
+      
+      // SSE Transport endpoints (legacy support)
+      if (SUPPORT_SSE) {
+        app.get("/sse", async (_: Request, res: Response) => {
+          const transport = new SSEServerTransport("/messages", res);
+          sseTransports[transport.sessionId] = transport;
+          res.on("close", () => {
+            delete sseTransports[transport.sessionId];
+          });
+          await server.connect(transport);
         });
-        await server.connect(transport);
-      });
 
-      app.post("/messages", async (req: Request, res: Response) => {
-        const sessionId = req.query.sessionId as string;
-        const transport = transports[sessionId];
-        if (transport) {
-          await transport.handlePostMessage(req, res);
-        } else {
-          res.status(400).send("No transport found for sessionId");
-        }
-      });
+        app.post("/messages", async (req: Request, res: Response) => {
+          const sessionId = req.query.sessionId as string;
+          const transport = sseTransports[sessionId];
+          if (transport) {
+            await transport.handlePostMessage(req, res);
+          } else {
+            res.status(400).send("No transport found for sessionId");
+          }
+        });
+      }
+      
+      // Streamable HTTP Transport endpoint
+      if (SUPPORT_STREAMABLE_HTTP) {
+        app.post("/mcp", async (req: Request, res: Response) => {
+          try {
+            const sessionId = req.headers['mcp-session-id'] as string;
+            const message = req.body;
+            
+            // Handle initialization
+            if (message.method === "initialize") {
+              const newSessionId = sessionId || generateSessionId();
+              streamableSessions[newSessionId] = {
+                initialized: true,
+                createdAt: new Date().toISOString()
+              };
+              
+              // Return initialization response
+              const result = {
+                jsonrpc: "2.0",
+                id: message.id,
+                result: {
+                  protocolVersion: "2025-03-26",
+                  capabilities: {
+                    tools: {},
+                    resources: {},
+                    prompts: {}
+                  },
+                  serverInfo: {
+                    name: "gitlab-mcp",
+                    version: process.env.npm_package_version || "unknown"
+                  }
+                }
+              };
+              
+              res.setHeader('Mcp-Session-Id', newSessionId);
+              res.setHeader('Content-Type', 'application/json');
+              res.json(result);
+              return;
+            }
+            
+            // Validate session for other requests
+            if (!sessionId || !streamableSessions[sessionId]) {
+              res.status(400).json({ error: "Invalid or missing session ID" });
+              return;
+            }
+            
+            // For now, return not implemented for other methods
+            res.status(501).json({
+              jsonrpc: "2.0",
+              id: message.id,
+              error: {
+                code: -32601,
+                message: "Method not implemented in streamable HTTP transport"
+              }
+            });
+            
+          } catch (error) {
+            console.error("Error handling streamable HTTP request:", error);
+            res.status(500).json({
+              jsonrpc: "2.0",
+              id: req.body?.id || null,
+              error: {
+                code: -32603,
+                message: "Internal error"
+              }
+            });
+          }
+        });
+      }
 
       app.get("/health", (_: Request, res: Response) => {
         res.status(200).json({
           status: "healthy",
           version: process.env.npm_package_version || "unknown",
+          transports: {
+            sse: SUPPORT_SSE,
+            streamableHttp: SUPPORT_STREAMABLE_HTTP
+          },
+          uptime: process.uptime()
         });
       });
 
       const PORT = process.env.PORT || 3002;
       app.listen(PORT, () => {
-        console.log(`Server is running on port ${PORT}`);
+        console.log(`Server running on port ${PORT} with transport mode: ${TRANSPORT_MODE}`);
       });
     }
   } catch (error) {
     console.error("Error initializing server:", error);
     process.exit(1);
   }
+}
+
+// Helper function to generate session IDs
+function generateSessionId(): string {
+  return Math.random().toString(36).substring(2, 15) + 
+         Math.random().toString(36).substring(2, 15);
 }
 
 runServer().catch(error => {

@@ -116,6 +116,8 @@ $ sh scripts/image_push.sh docker_user_name
 - `USE_MILESTONE`: When set to 'true', enables the milestone-related tools (list_milestones, get_milestone, create_milestone, edit_milestone, delete_milestone, get_milestone_issue, get_milestone_merge_requests, promote_milestone, get_milestone_burndown_events). By default, milestone features are disabled.
 - `USE_PIPELINE`: When set to 'true', enables the pipeline-related tools (list_pipelines, get_pipeline, list_pipeline_jobs, get_pipeline_job, get_pipeline_job_output, create_pipeline, retry_pipeline, cancel_pipeline). By default, pipeline features are disabled.
 - `GITLAB_AUTH_COOKIE_PATH`: Path to an authentication cookie file for GitLab instances that require cookie-based authentication. When provided, the cookie will be included in all GitLab API requests.
+- `TRANSPORT_MODE`: Transport protocol to use. Options: `stdio` (default), `sse`, `streamable-http`, `dual`. The `dual` mode supports both SSE and streamable HTTP transports simultaneously.
+- `SSE`: Legacy environment variable. When set to 'true', enables SSE transport mode. Superseded by `TRANSPORT_MODE`.
 
 [![Star History Chart](https://api.star-history.com/svg?repos=zereight/gitlab-mcp&type=Date)](https://www.star-history.com/#zereight/gitlab-mcp&Date)
 

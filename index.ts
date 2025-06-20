@@ -3,6 +3,7 @@
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import nodeFetch from "node-fetch";
 import fetchCookie from "fetch-cookie";
@@ -4309,9 +4310,8 @@ async function runServer() {
       const app = express();
       app.use(express.json());
       
-      // Session management for both transports
+      // Session management for SSE transports
       const sseTransports: { [sessionId: string]: SSEServerTransport } = {};
-      const streamableSessions: { [sessionId: string]: any } = {};
       
       // SSE Transport endpoints (legacy support)
       if (SUPPORT_SSE) {
@@ -4337,59 +4337,21 @@ async function runServer() {
       
       // Streamable HTTP Transport endpoint
       if (SUPPORT_STREAMABLE_HTTP) {
-        app.post("/mcp", async (req: Request, res: Response) => {
+        // Create a single StreamableHTTPServerTransport instance
+        const streamableTransport = new StreamableHTTPServerTransport({
+          sessionIdGenerator: () => generateSessionId(),
+          onsessioninitialized: (sessionId: string) => {
+            console.log(`New streamable HTTP session initialized: ${sessionId}`);
+          }
+        });
+        
+        // Connect to server
+        await server.connect(streamableTransport);
+        
+        app.all("/mcp", async (req: Request, res: Response) => {
           try {
-            const sessionId = req.headers['mcp-session-id'] as string;
-            const message = req.body;
-            
-            // Handle initialization
-            if (message.method === "initialize") {
-              const newSessionId = sessionId || generateSessionId();
-              streamableSessions[newSessionId] = {
-                initialized: true,
-                createdAt: new Date().toISOString()
-              };
-              
-              // Return initialization response
-              const result = {
-                jsonrpc: "2.0",
-                id: message.id,
-                result: {
-                  protocolVersion: "2025-03-26",
-                  capabilities: {
-                    tools: {},
-                    resources: {},
-                    prompts: {}
-                  },
-                  serverInfo: {
-                    name: "gitlab-mcp",
-                    version: process.env.npm_package_version || "unknown"
-                  }
-                }
-              };
-              
-              res.setHeader('Mcp-Session-Id', newSessionId);
-              res.setHeader('Content-Type', 'application/json');
-              res.json(result);
-              return;
-            }
-            
-            // Validate session for other requests
-            if (!sessionId || !streamableSessions[sessionId]) {
-              res.status(400).json({ error: "Invalid or missing session ID" });
-              return;
-            }
-            
-            // For now, return not implemented for other methods
-            res.status(501).json({
-              jsonrpc: "2.0",
-              id: message.id,
-              error: {
-                code: -32601,
-                message: "Method not implemented in streamable HTTP transport"
-              }
-            });
-            
+            // Handle the request using the SDK transport
+            await streamableTransport.handleRequest(req, res, req.body);
           } catch (error) {
             console.error("Error handling streamable HTTP request:", error);
             res.status(500).json({
